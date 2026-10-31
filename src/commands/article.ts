@@ -1,8 +1,13 @@
 import { EmbedBuilder, type ChatInputCommandInteraction } from "discord.js";
 import { summarizeArticle } from "../ai/openrouter.js";
+import {
+  ARTICLE_REFRESH_COOLDOWN_MS,
+  shareInFlight,
+  takeModelBudget,
+  takeUserCommand
+} from "../ai/summary-guard.js";
 import { config } from "../config/env.js";
 import {
-  deleteCachedArticleSummary,
   getCachedArticleSummary,
   saveArticleSummary
 } from "../db/article-summary-repository.js";
@@ -103,6 +108,14 @@ export async function handleArticleCommand(interaction: ChatInputCommandInteract
     return;
   }
 
+  if (!takeUserCommand(interaction.user.id)) {
+    await interaction.reply({
+      content: "Слишком много запросов. Подождите минуту и попробуйте снова.",
+      ephemeral: true
+    });
+    return;
+  }
+
   await interaction.deferReply();
 
   const hits = await searchArticles(query);
@@ -130,30 +143,48 @@ export async function handleArticleCommand(interaction: ChatInputCommandInteract
     return;
   }
 
-  if (cached) {
-    await deleteCachedArticleSummary(selected.id);
+  // Edits invalidate the cache, so repeated edits could otherwise force a new
+  // paid summary on every command. A recent summary is shown instead.
+  const cachedAt = cached ? new Date(cached.cached_at).getTime() : Number.NaN;
+  if (cached && Date.now() - cachedAt < ARTICLE_REFRESH_COOLDOWN_MS) {
+    await replyWithArticle(interaction, {
+      title: cached.title,
+      url: normalizeWikiArticleUrl(cached.url, selected.id),
+      sectionName: cached.section_name,
+      updatedAt: cached.wiki_updated_at,
+      summary: cached.summary,
+      fromCache: true
+    });
+    return;
   }
 
-  const article = await getArticleById(selected.id);
-  const summary = await summarizeArticle(article.title, article.content);
-  const canonicalUrl = normalizeWikiArticleUrl(article.url, article.id);
-
-  await saveArticleSummary({
-    articleId: article.id,
-    title: article.title,
-    url: canonicalUrl,
-    sectionName: article.section_name,
-    authorUsername: article.author_username,
-    wikiUpdatedAt: article.updated_at,
-    summary
+  // Concurrent commands for the same revision share one fetch and one summary.
+  const fresh = await shareInFlight(`${selected.id}:${selected.updated_at}`, async () => {
+    const article = await getArticleById(selected.id);
+    const canonicalUrl = normalizeWikiArticleUrl(article.url, article.id);
+    if (!takeModelBudget()) {
+      logger.warn("Summary budget spent; showing the article excerpt", { articleId: article.id });
+      return { article, canonicalUrl, summary: clip(cleanDiscordText(article.content), 900) };
+    }
+    const summary = await summarizeArticle(article.title, article.content);
+    await saveArticleSummary({
+      articleId: article.id,
+      title: article.title,
+      url: canonicalUrl,
+      sectionName: article.section_name,
+      authorUsername: article.author_username,
+      wikiUpdatedAt: article.updated_at,
+      summary
+    });
+    return { article, canonicalUrl, summary };
   });
 
   await replyWithArticle(interaction, {
-    title: article.title,
-    url: canonicalUrl,
-    sectionName: article.section_name,
-    updatedAt: article.updated_at,
-    summary,
+    title: fresh.article.title,
+    url: fresh.canonicalUrl,
+    sectionName: fresh.article.section_name,
+    updatedAt: fresh.article.updated_at,
+    summary: fresh.summary,
     fromCache: false
   });
 }
